@@ -7,7 +7,10 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from atomic_operations.consts import ATOMIC_OPERATIONS
+from atomic_operations.consts import (
+    ATOMIC_OPERATIONS,
+    OP_ADD, OP_UPDATE, OP_REMOVE, OP_INVOKE, OP_UPDATE_RELATIONSHIP
+)
 from atomic_operations.exceptions import UnprocessableEntity
 from atomic_operations.parsers import AtomicOperationParser
 from atomic_operations.renderers import AtomicResultRenderer
@@ -42,26 +45,40 @@ class AtomicOperationView(APIView):
             raise ImproperlyConfigured("You need to define the serializer classes. "
                                        "Otherwise serialization of json:api primary data is not possible.")
 
-    def get_serializer_class(self, operation_code: str, resource_type: str):
-        serializer_class = self.get_serializer_classes().get(
-            f"{operation_code}:{resource_type}")
+    def extract_action_from_href(self, href: str) -> str:
+        """Extract the action name from an href path.
+        
+        Examples:
+            '/api/annotations/create' -> 'create'
+            '/api/annotations/delete/' -> 'delete'
+        """
+        return href.rstrip('/').split('/')[-1]
+
+    def get_serializer_class(self, operation_code: str, resource_type: str, href: str = None):
+        if operation_code == OP_INVOKE and href:
+            # For invoke operations, use the href to determine the serializer
+            action = self.extract_action_from_href(href)
+            key = f"{operation_code}:{resource_type}/{action}"
+        else:
+            key = f"{operation_code}:{resource_type}"
+            
+        serializer_class = self.get_serializer_classes().get(key)
         if serializer_class:
             return serializer_class
         else:
-            # TODO: is this error message correct? Check jsonapi spec for this
             raise ImproperlyConfigured(
-                f"No serializer for type `{resource_type}` and operation `{operation_code}` where found")
+                f"No serializer found for resource type '{resource_type}' and operation '{operation_code}' (key: {key})")
 
-    def get_serializer(self, idx, operation_code, resource_type, *args, **kwargs):
+    def get_serializer(self, idx, operation_code, resource_type, href=None, *args, **kwargs):
         """
         Return the serializer instance that should be used for validating and
         deserializing input, and for serializing output.
         """
         serializer_class = self.get_serializer_class(
-            operation_code, resource_type)
+            operation_code, resource_type, href)
         kwargs.setdefault('context', self.get_serializer_context())
 
-        if operation_code in ["update", "remove"]:
+        if operation_code in [OP_UPDATE, OP_REMOVE]:
             try:
                 kwargs.update({
                     "instance": serializer_class.Meta.model.objects.get(pk=kwargs["data"]["id"])
@@ -78,6 +95,8 @@ class AtomicOperationView(APIView):
                     }
                 ]
                 )
+        # For invoke operations, no special handling needed here
+        # The serializer will handle the specific format
 
         return serializer_class(*args, **kwargs)
 
@@ -96,21 +115,25 @@ class AtomicOperationView(APIView):
         return self.perform_operations(request.data)
 
     def handle_sequential(self, serializer, operation_code):
-        if operation_code in ["add", "update", "update-relationship"]:
+        if operation_code in [OP_ADD, OP_UPDATE, OP_UPDATE_RELATIONSHIP]:
             lid = serializer.initial_data.get("lid", None)
 
             serializer.is_valid(raise_exception=True)
             serializer.save()
 
-            if operation_code == "add" and lid:
+            if operation_code == OP_ADD and lid:
                 resource_type = serializer.initial_data["type"]
                 self.lid_to_id[resource_type][lid] = serializer.data["id"]
 
-            if operation_code != "update-relationship":
+            if operation_code != OP_UPDATE_RELATIONSHIP:
                 self.response_data.append(serializer.data)
-        else:
-            # remove
+        elif operation_code == OP_REMOVE:
             serializer.instance.delete()
+        elif operation_code == OP_INVOKE:
+            # Handle invoke operation - validate and execute custom action
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            self.response_data.append(serializer.data)
 
     def perform_bulk_create(self, bulk_operation_data):
         objs = []
@@ -194,15 +217,27 @@ class AtomicOperationView(APIView):
                 operation_code = next(iter(operation))
                 obj = operation[operation_code]
 
-                should_raise_unknown_lid_error = operation_code != "add"
+                should_raise_unknown_lid_error = operation_code != OP_ADD
                 self.substitute_lids(obj, idx, should_raise_unknown_lid_error)
 
+                # Extract href for invoke operations
+                href = obj.get("href") if operation_code == OP_INVOKE else None
+                
+                # Prepare data and operation code for serializer
+                if operation_code == OP_INVOKE:
+                    serializer_data = obj.get("data", obj)
+                else:
+                    serializer_data = obj
+                    
+                effective_operation_code = OP_UPDATE if operation_code == OP_UPDATE_RELATIONSHIP else operation_code
+                
                 serializer = self.get_serializer(
                     idx=idx,
-                    data=obj,
-                    operation_code="update" if operation_code == "update-relationship" else operation_code,
+                    data=serializer_data,
+                    operation_code=effective_operation_code,
                     resource_type=obj["type"],
-                    partial=True if "update" in operation_code else False
+                    href=href,
+                    partial=operation_code in [OP_UPDATE, OP_UPDATE_RELATIONSHIP]
                 )
 
                 if self.sequential:

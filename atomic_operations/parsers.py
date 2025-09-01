@@ -7,7 +7,11 @@ from rest_framework_json_api import renderers
 from rest_framework_json_api.parsers import JSONParser
 from rest_framework_json_api.utils import undo_format_field_name
 
-from atomic_operations.consts import ATOMIC_CONTENT_TYPE, ATOMIC_OPERATIONS
+from atomic_operations.consts import (
+    ATOMIC_CONTENT_TYPE, ATOMIC_OPERATIONS,
+    OP_ADD, OP_UPDATE, OP_REMOVE, OP_INVOKE, OP_UPDATE_RELATIONSHIP,
+    SUPPORTED_OPERATIONS
+)
 from atomic_operations.exceptions import (
     InvalidPrimaryDataType,
     JsonApiParseError,
@@ -125,6 +129,31 @@ class AtomicOperationParser(JSONParser):
                 pointer=f"/{ATOMIC_OPERATIONS}/{idx}"
             )
         self.check_resource_identifier_object(idx, ref, "remove")
+    
+    def check_invoke_operation(self, idx, operation):
+        """Check invoke operation for custom actions"""
+        ref = operation.get("ref")
+        if not ref:
+            raise JsonApiParseError(
+                id="missing-ref-attribute",
+                detail="`ref` is required for invoke operation",
+                pointer=f"/{ATOMIC_OPERATIONS}/{idx}"
+            )
+        
+        # Validate required fields for invoke operations
+        if not ref.get("href"):
+            raise JsonApiParseError(
+                id="missing-href-attribute",
+                detail="`href` is required in ref for invoke operation",
+                pointer=f"/{ATOMIC_OPERATIONS}/{idx}/ref"
+            )
+        
+        if not ref.get("type"):
+            raise JsonApiParseError(
+                id="missing-type",
+                detail="`type` is required in ref for invoke operation",
+                pointer=f"/{ATOMIC_OPERATIONS}/{idx}/ref"
+            )
 
     def check_operation(self, idx: int, operation: Dict):
         operation_code: str = operation.get("op")
@@ -139,26 +168,27 @@ class AtomicOperationParser(JSONParser):
                 pointer=f"/{ATOMIC_OPERATIONS}/{idx}/op"
             )
 
-        if href:
-            # for now we do not support href's. This is optional by the standard (MAY) https://jsonapi.org/ext/atomic/#operation-objects
+        if href and operation_code != OP_INVOKE:
+            # href is only supported for invoke operations (optional by standard)
             raise JsonApiParseError(
                 id="not-implemented",
-                detail="Received operation using `href` to refencing objects which is not implemented by this api. Use `ref` instead.",
+                detail="Operation 'href' is only supported for invoke operations. Use 'ref' instead.",
                 pointer=f"/{ATOMIC_OPERATIONS}/{idx}/href"
             )
 
-        if operation_code == "add":
+        # Validate operation based on type
+        if operation_code == OP_ADD:
             self.check_add_operation(idx, data)
-
-        elif operation_code == "remove":
+        elif operation_code == OP_REMOVE:
             self.check_remove_operation(idx, ref)
-
-        elif operation_code == "update":
+        elif operation_code == OP_UPDATE:
             self.check_update_operation(idx, operation)
+        elif operation_code == OP_INVOKE:
+            self.check_invoke_operation(idx, operation)
         else:
             raise JsonApiParseError(
                 id="unknown-operation-code",
-                detail=f"Unknown operation `{operation_code}` received",
+                detail=f"Unknown operation '{operation_code}'. Supported operations: {', '.join(SUPPORTED_OPERATIONS)}",
                 pointer=f"/{ATOMIC_OPERATIONS}/{idx}/op"
             )
 
@@ -208,29 +238,42 @@ class AtomicOperationParser(JSONParser):
 
             self.check_operation(idx, operation)
 
-            if operation["op"] == "update" and operation.get("ref"):
-                # special case relation update
-                ref: Dict = operation["ref"]
+            op_code = operation["op"]
+            
+            if op_code == OP_UPDATE and operation.get("ref"):
+                # Handle relationship update
+                ref = operation["ref"]
                 ref["relationships"] = {
-                    ref.pop("relationship"): {
-                        "data": operation["data"]
-                    }
+                    ref.pop("relationship"): {"data": operation["data"]}
                 }
-                _parsed_data = self.parse_operation(
-                    resource_identifier_object=ref,
-                    result=result
-                )
-
-                operation_code = f'{operation["op"]}-relationship'
+                _parsed_data = self.parse_operation(ref, result)
+                operation_code = OP_UPDATE_RELATIONSHIP
+                
+            elif op_code == OP_INVOKE:
+                # Handle invoke operation for custom actions
+                ref = operation["ref"]
+                data = operation.get("data", {})
+                
+                # Parse data if it has JSON:API structure
+                if "attributes" in data or "relationships" in data:
+                    parsed_invoke_data = self.parse_operation(data, result)
+                else:
+                    parsed_invoke_data = data
+                
+                _parsed_data = {
+                    "type": ref["type"],
+                    "href": ref["href"],
+                    "data": parsed_invoke_data
+                }
+                operation_code = OP_INVOKE
 
             else:
+                # Standard operations (add, update, remove)
                 _parsed_data = self.parse_operation(
-                    resource_identifier_object=operation.get(
-                        "data", operation.get("ref")
-                    ),
-                    result=result
+                    operation.get("data", operation.get("ref")),
+                    result
                 )
-                operation_code = operation["op"]
+                operation_code = op_code
 
             parsed_data.append({
                 operation_code: _parsed_data
