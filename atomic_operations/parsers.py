@@ -153,6 +153,7 @@ class AtomicOperationParser(JSONParser):
                 id="missing-type",
                 detail="`type` is required in ref for invoke operation",
                 pointer=f"/{ATOMIC_OPERATIONS}/{idx}/ref"
+            )
 
     def check_operation(self, idx: int, operation: Dict):
         operation_code: str = operation.get("op")
