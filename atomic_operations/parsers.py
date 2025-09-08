@@ -153,7 +153,6 @@ class AtomicOperationParser(JSONParser):
                 id="missing-type",
                 detail="`type` is required in ref for invoke operation",
                 pointer=f"/{ATOMIC_OPERATIONS}/{idx}/ref"
-            )
 
     def check_operation(self, idx: int, operation: Dict):
         operation_code: str = operation.get("op")
@@ -192,6 +191,10 @@ class AtomicOperationParser(JSONParser):
                 pointer=f"/{ATOMIC_OPERATIONS}/{idx}/op"
             )
 
+    def is_bulk_operation_type(self, resource_type):
+        """Check if a resource type is a bulk operation type"""
+        return resource_type and resource_type.startswith("bulk")
+    
     def parse_id_lid_and_type(self, resource_identifier_object):
         parsed_data = {"id": resource_identifier_object.get(
             "id")} if "id" in resource_identifier_object else {}
@@ -266,6 +269,12 @@ class AtomicOperationParser(JSONParser):
                     "data": parsed_invoke_data
                 }
                 operation_code = OP_INVOKE
+            
+            elif op_code == OP_ADD and self.is_bulk_operation_type(operation.get("data", {}).get("type")):
+                # Handle bulk operations as special add operations
+                # These follow the standard JSON:API format but with special resource types
+                _parsed_data = self.parse_operation(operation["data"], result)
+                operation_code = OP_ADD
 
             else:
                 # Standard operations (add, update, remove)

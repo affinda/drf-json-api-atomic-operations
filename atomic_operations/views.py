@@ -54,11 +54,18 @@ class AtomicOperationView(APIView):
         """
         return href.rstrip('/').split('/')[-1]
 
+    def is_bulk_operation_type(self, resource_type: str) -> bool:
+        """Check if a resource type is a bulk operation type"""
+        return resource_type and resource_type.startswith("bulk")
+    
     def get_serializer_class(self, operation_code: str, resource_type: str, href: str = None):
         if operation_code == OP_INVOKE and href:
             # For invoke operations, use the href to determine the serializer
             action = self.extract_action_from_href(href)
             key = f"{operation_code}:{resource_type}/{action}"
+        elif operation_code == OP_ADD and self.is_bulk_operation_type(resource_type):
+            # For bulk operations (e.g., bulkAnnotationCreate), use the resource type directly
+            key = f"{operation_code}:{resource_type}"
         else:
             key = f"{operation_code}:{resource_type}"
             
@@ -117,16 +124,27 @@ class AtomicOperationView(APIView):
     def handle_sequential(self, serializer, operation_code):
         if operation_code in [OP_ADD, OP_UPDATE, OP_UPDATE_RELATIONSHIP]:
             lid = serializer.initial_data.get("lid", None)
+            resource_type = serializer.initial_data.get("type")
+            
+            # Check if this is a bulk operation type
+            if operation_code == OP_ADD and self.is_bulk_operation_type(resource_type):
+                # Handle bulk operations specially
+                serializer.is_valid(raise_exception=True)
+                result = serializer.save()
+                # For bulk operations, the result might be a special structure
+                if hasattr(result, 'data'):
+                    self.response_data.append(result.data)
+                else:
+                    self.response_data.append(serializer.data)
+            else:
+                serializer.is_valid(raise_exception=True)
+                serializer.save()
 
-            serializer.is_valid(raise_exception=True)
-            serializer.save()
+                if operation_code == OP_ADD and lid:
+                    self.lid_to_id[resource_type][lid] = serializer.data["id"]
 
-            if operation_code == OP_ADD and lid:
-                resource_type = serializer.initial_data["type"]
-                self.lid_to_id[resource_type][lid] = serializer.data["id"]
-
-            if operation_code != OP_UPDATE_RELATIONSHIP:
-                self.response_data.append(serializer.data)
+                if operation_code != OP_UPDATE_RELATIONSHIP:
+                    self.response_data.append(serializer.data)
         elif operation_code == OP_REMOVE:
             serializer.instance.delete()
         elif operation_code == OP_INVOKE:
