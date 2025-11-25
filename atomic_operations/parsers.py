@@ -57,7 +57,7 @@ class AtomicOperationParser(JSONParser):
                     detail="The resource identifier object must contain an `id` member or a `lid` member",
                     pointer=f"/{ATOMIC_OPERATIONS}/{idx}/{'data' if operation_code == 'update' else 'ref'}"
                 )
-            
+
             if resource_id and resource_lid:
                 raise JsonApiParseError(
                     id="multiple-id-fields",
@@ -129,7 +129,7 @@ class AtomicOperationParser(JSONParser):
                 pointer=f"/{ATOMIC_OPERATIONS}/{idx}"
             )
         self.check_resource_identifier_object(idx, ref, "remove")
-    
+
     def check_invoke_operation(self, idx, operation):
         """Check invoke operation for custom actions"""
         ref = operation.get("ref")
@@ -139,7 +139,7 @@ class AtomicOperationParser(JSONParser):
                 detail="`ref` is required for invoke operation",
                 pointer=f"/{ATOMIC_OPERATIONS}/{idx}"
             )
-        
+
         # Validate required fields for invoke operations
         if not ref.get("href"):
             raise JsonApiParseError(
@@ -147,7 +147,7 @@ class AtomicOperationParser(JSONParser):
                 detail="`href` is required in ref for invoke operation",
                 pointer=f"/{ATOMIC_OPERATIONS}/{idx}/ref"
             )
-        
+
         if not ref.get("type"):
             raise JsonApiParseError(
                 id="missing-type",
@@ -195,7 +195,7 @@ class AtomicOperationParser(JSONParser):
     def is_bulk_operation_type(self, resource_type):
         """Check if a resource type is a bulk operation type"""
         return resource_type and resource_type.startswith("bulk")
-    
+
     def parse_id_lid_and_type(self, resource_identifier_object):
         parsed_data = {"id": resource_identifier_object.get(
             "id")} if "id" in resource_identifier_object else {}
@@ -203,7 +203,7 @@ class AtomicOperationParser(JSONParser):
 
         if lid := resource_identifier_object.get("lid", None):
             parsed_data["lid"] = lid
-    
+
         return parsed_data
 
     def check_root(self, result):
@@ -221,6 +221,30 @@ class AtomicOperationParser(JSONParser):
                 detail="Received operation objects is not a valid JSON:API atomic operation request",
                 pointer=f"/{ATOMIC_OPERATIONS}"
             )
+
+    def parse_operation_metadata(self, resource_identifier_object: dict, metadata: dict):
+        """Parse the meta object from operation data if it exists"""
+        if not metadata:
+            return {}
+        idx = None
+        if "id" in resource_identifier_object:
+            idx = resource_identifier_object.get("id")
+        elif "lid" in resource_identifier_object:
+            idx = resource_identifier_object.get("lid")
+        if not isinstance(metadata, dict):
+            raise JsonApiParseError(
+                id="invalid-operation-meta-object",
+                detail="Received operation meta data value is not valid",
+                pointer=f"{ATOMIC_OPERATIONS}/{idx}/meta",
+            )
+        for key, value in metadata.items():
+            if key == "include" and not isinstance(value, list):
+                raise JsonApiParseError(
+                    id="invalid-operation-include-value",
+                    detail="Received operation include value is not a list",
+                    pointer=f"{ATOMIC_OPERATIONS}/{idx}/meta/include",
+                )
+        return {"meta": metadata}
 
     def parse_operation(self, resource_identifier_object, result):
         _parsed_data = self.parse_id_lid_and_type(resource_identifier_object)
@@ -241,9 +265,10 @@ class AtomicOperationParser(JSONParser):
         for idx, operation in enumerate(result[ATOMIC_OPERATIONS]):
 
             self.check_operation(idx, operation)
+            meta = operation.get("meta")
 
             op_code = operation["op"]
-            
+
             if op_code == OP_UPDATE and operation.get("ref"):
                 # Handle relationship update
                 ref = operation["ref"]
@@ -251,38 +276,40 @@ class AtomicOperationParser(JSONParser):
                     ref.pop("relationship"): {"data": operation["data"]}
                 }
                 _parsed_data = self.parse_operation(ref, result)
+                _parsed_data.update(self.parse_operation_metadata(ref, meta))
                 operation_code = OP_UPDATE_RELATIONSHIP
-                
+
             elif op_code == OP_INVOKE:
                 # Handle invoke operation for custom actions
                 ref = operation["ref"]
                 data = operation.get("data", {})
-                
+
                 # Parse data if it has JSON:API structure
                 if "attributes" in data or "relationships" in data:
                     parsed_invoke_data = self.parse_operation(data, result)
                 else:
                     parsed_invoke_data = data
-                
+
                 _parsed_data = {
                     "type": ref["type"],
                     "href": ref["href"],
                     "data": parsed_invoke_data
                 }
+                _parsed_data.update(self.parse_operation_metadata(ref, meta))
                 operation_code = OP_INVOKE
-            
+
             elif op_code == OP_ADD and self.is_bulk_operation_type(operation.get("data", {}).get("type")):
                 # Handle bulk operations as special add operations
                 # These follow the standard JSON:API format but with special resource types
                 _parsed_data = self.parse_operation(operation["data"], result)
+                _parsed_data.update(self.parse_operation_metadata(operation["data"], meta))
                 operation_code = OP_ADD
 
             else:
                 # Standard operations (add, update, remove)
-                _parsed_data = self.parse_operation(
-                    operation.get("data", operation.get("ref")),
-                    result
-                )
+                data = operation.get("data", operation.get("ref"))
+                _parsed_data = self.parse_operation(data, result)
+                _parsed_data.update(self.parse_operation_metadata(data, meta))
                 operation_code = op_code
 
             parsed_data.append({

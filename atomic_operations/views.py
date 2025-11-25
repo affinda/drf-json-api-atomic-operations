@@ -14,6 +14,7 @@ from atomic_operations.consts import (
 from atomic_operations.exceptions import UnprocessableEntity
 from atomic_operations.parsers import AtomicOperationParser
 from atomic_operations.renderers import AtomicResultRenderer
+from atomic_operations.serializers import AtomicOperationIncludedResourcesValidationMixin
 
 
 class AtomicOperationView(APIView):
@@ -47,7 +48,7 @@ class AtomicOperationView(APIView):
 
     def extract_action_from_href(self, href: str) -> str:
         """Extract the action name from an href path.
-        
+
         Examples:
             '/api/annotations/create' -> 'create'
             '/api/annotations/delete/' -> 'delete'
@@ -57,7 +58,7 @@ class AtomicOperationView(APIView):
     def is_bulk_operation_type(self, resource_type: str) -> bool:
         """Check if a resource type is a bulk operation type"""
         return resource_type and resource_type.startswith("bulk")
-    
+
     def get_serializer_class(self, operation_code: str, resource_type: str, href: str = None):
         if operation_code == OP_INVOKE and href:
             # For invoke operations, use the href to determine the serializer
@@ -68,10 +69,16 @@ class AtomicOperationView(APIView):
             key = f"{operation_code}:{resource_type}"
         else:
             key = f"{operation_code}:{resource_type}"
-            
+
         serializer_class = self.get_serializer_classes().get(key)
         if serializer_class:
-            return serializer_class
+            # wrap operation's serializer with AtomicOperationIncludedResourcesValidationMixin
+            wrapped_serializer_class = type(
+                "WrappedSerializer",
+                (AtomicOperationIncludedResourcesValidationMixin, serializer_class),
+                {},
+            )
+            return wrapped_serializer_class
         else:
             raise ImproperlyConfigured(
                 f"No serializer found for resource type '{resource_type}' and operation '{operation_code}' (key: {key})")
@@ -81,6 +88,8 @@ class AtomicOperationView(APIView):
         Return the serializer instance that should be used for validating and
         deserializing input, and for serializing output.
         """
+        self._operation_code = operation_code
+        self._resource_type = resource_type
         serializer_class = self.get_serializer_class(
             operation_code, resource_type, href)
         kwargs.setdefault('context', self.get_serializer_context())
@@ -114,8 +123,9 @@ class AtomicOperationView(APIView):
         return {
             'request': self.request,
             'format': self.format_kwarg,
-            'view': self
-
+            'view': self,
+            'operation_code': getattr(self, '_operation_code', None),
+            'resource_type': getattr(self, '_resource_type', None),
         }
 
     def post(self, request, *args, **kwargs):
@@ -125,7 +135,7 @@ class AtomicOperationView(APIView):
         if operation_code in [OP_ADD, OP_UPDATE, OP_UPDATE_RELATIONSHIP]:
             lid = serializer.initial_data.get("lid", None)
             resource_type = serializer.initial_data.get("type")
-            
+
             # Check if this is a bulk operation type
             if operation_code == OP_ADD and self.is_bulk_operation_type(resource_type):
                 # Handle bulk operations specially
@@ -211,15 +221,15 @@ class AtomicOperationView(APIView):
                         "status": "422"
                     }
                 ])
-            
+
         for _, value in data.items():
             if isinstance(value, dict):
                 self.substitute_lids(value, idx, should_raise_unknown_lid_error=True)
             elif isinstance(value, list):
                 [self.substitute_lids(value, idx, should_raise_unknown_lid_error=True) for value in value]
 
-        return data     
-        
+        return data
+
     def perform_operations(self, parsed_operations: List[Dict]):
         self.response_data = []  # reset local response data storage
 
@@ -240,15 +250,15 @@ class AtomicOperationView(APIView):
 
                 # Extract href for invoke operations
                 href = obj.get("href") if operation_code == OP_INVOKE else None
-                
+
                 # Prepare data and operation code for serializer
                 if operation_code == OP_INVOKE:
                     serializer_data = obj.get("data", obj)
                 else:
                     serializer_data = obj
-                    
+
                 effective_operation_code = OP_UPDATE if operation_code == OP_UPDATE_RELATIONSHIP else operation_code
-                
+
                 serializer = self.get_serializer(
                     idx=idx,
                     data=serializer_data,
